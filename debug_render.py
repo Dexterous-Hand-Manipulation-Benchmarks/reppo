@@ -19,6 +19,7 @@ import os
 import re
 import wandb
 import argparse
+import math
 
 from omegaconf import OmegaConf
 from src.jaxrl.reppo import get_common_argparser, get_all_env_cfg, BaseEnv, make_policy, DexmachinaGymnaxWrapper, ReppoConfig, make_init
@@ -64,13 +65,13 @@ else:
 # =====================================================================
 # WANDB INITIALIZATION (RESUME RUN)
 # =====================================================================
-run_id = get_wandb_run_id(ckpt_dir)
-if run_id is None:
-    print(">>> Warning: Could not auto-detect WandB run ID. WandB will start a new run instead of resuming.")
-    wandb.init(project=args.wandb_project, name="video_eval")
-else:
-    print(f">>> Resuming WandB run ID: {run_id}")
-    wandb.init(project=args.wandb_project, id=run_id, resume="must")
+#run_id = get_wandb_run_id(ckpt_dir)
+#if run_id is None:
+#    print(">>> Warning: Could not auto-detect WandB run ID. WandB will start a new run instead of resuming.")
+#    wandb.init(project=args.wandb_project, name="video_eval")
+#else:
+#    print(f">>> Resuming WandB run ID: {run_id}")
+#    wandb.init(project=args.wandb_project, id=run_id, resume="must")
 
 # =====================================================================
 # ENVIRONMENT SETUP
@@ -91,12 +92,57 @@ args.camera_kwargs = {
     "front": {'res': (256, 256), 'pos': (0.0, -1.6, 2.2), 'lookat': (0.0, -0.1, 1.2), 'fov': 30}
 }
 
+# =================================================================
+# THE TRULY GENERIC NATIVE INTEGRATION
+# =================================================================
+# This will automatically handle ALL present and future YAML configs!
+for key, value in env_cfg.items():
+    # 1. Always set the top-level key (handles lists like task_rew_betas)
+    setattr(args, key, value)
+    
+    # 2. If it's a dictionary (like reward_cfg), flatten it so the parser can read it
+    if isinstance(value, dict):
+        for sub_k, sub_v in value.items():
+            setattr(args, sub_k, sub_v)
+            
+setattr(args, "use_retarget_contact", True)
+
+# Safely bypass the Imitation kill switches!
+setattr(args, "early_reset_threshold", 0.0)
+setattr(args, "aux_reset_thres", [0.0, 0.0, 0.0])
+
+# CRITICAL: Keep this True so the wrapper unpacks the variables correctly!
+setattr(args, "use_rl_games", True)
+# =================================================================
+
 env_kwargs = get_all_env_cfg(args, device='cuda:0')
+
+# =================================================================
+# THE TRULY GENERIC SURGICAL BYPASS
+# =================================================================
+# Instead of forcing keys, gently update existing dictionaries that BaseEnv requested
+for key, value in env_cfg.items():
+    if isinstance(value, dict):
+        # This prevents "unexpected keyword argument" crashes!
+        if key in env_kwargs and isinstance(env_kwargs[key], dict):
+            env_kwargs[key].update(value)
+# =================================================================
+
 raw_env = BaseEnv(**env_kwargs)
-base_env = DexmachinaGymnaxWrapper(env=raw_env)
+
+base_env = DexmachinaGymnaxWrapper(
+    env=raw_env,
+    clip_obs=env_cfg.get("clip_obs", float("inf")),
+    clip_actions=env_cfg.get("clip_actions", float("inf")),
+    asymmetric_obs=env_cfg.get("asymmetric_obs", True),
+)
+
+# CRITICAL: Sync the evaluation loop safely!
+hp_dict = OmegaConf.to_container(hydra_cfg.hyperparameters, resolve=True)
+hp_dict["max_episode_steps"] = getattr(base_env, "max_episode_steps", hp_dict.get("max_episode_steps", 1000))
+reppo_cfg = ReppoConfig(**hp_dict)
 
 # FIX 1: Apply the exact same wrappers used during training!
-# This forces make_init to generate the `mean` and `var` variables in the PyTree.
 env = LogWrapper(base_env, args.num_envs)
 env = ClipAction(env)
 if reppo_cfg.normalize_env:
@@ -151,8 +197,8 @@ print(f">>> Found {len(checkpoint_paths)} Orbax checkpoints. Beginning evaluatio
 # =====================================================================
 # EVALUATION LOOP
 # =====================================================================
-wandb.define_metric("eval_step")
-wandb.define_metric("render_video", step_metric="eval_step")
+#wandb.define_metric("eval_step")
+#wandb.define_metric("render_video", step_metric="eval_step")
 
 latest_video_path = None
 checkpointer = ocp.StandardCheckpointer()
@@ -177,7 +223,6 @@ for ckpt_path in checkpoint_paths:
     rng, reset_key, eval_key = jax.random.split(rng, 3)
     
     # FIX 2: Pass the loaded normalization state into env.reset!
-    # This ensures your first observation is correctly normalized based on the training data.
     norm_state = final_state.last_env_state if reppo_cfg.normalize_env else None
     obs, critic_obs, env_state = env.reset(reset_key, norm_state)
     
@@ -185,7 +230,7 @@ for ckpt_path in checkpoint_paths:
     for _ in range(reppo_cfg.max_episode_steps):
         eval_key, act_key, step_key = jax.random.split(eval_key, 3)
         
-        # FIX 3: No manual math needed! The NormalizeVec wrapper handles everything natively.
+        # FIX 3: The NormalizeVec wrapper handles everything natively.
         action_jax, _ = policy(act_key, obs)
         
         obs, critic_obs, env_state, reward, done, info = env.step(
@@ -199,7 +244,6 @@ for ckpt_path in checkpoint_paths:
                 frame = np.array(frame)
             frames.append(frame)
             
-    # [Keep the rest of your video saving / WandB logic identical]
     if frames:
         video_array = np.array(frames)
         if video_array.ndim == 5:
@@ -208,11 +252,11 @@ for ckpt_path in checkpoint_paths:
         vid_filename = f"eval_video_step_{step_num}.mp4"
         imageio.mimsave(vid_filename, video_array, fps=30)
         
-        print(f">>> uploading {vid_filename} to wandb at step {step_num}...")
-        wandb.log({
-            "eval_step": step_num,
-            "render_video": wandb.Video(vid_filename, fps=30, format="mp4")
-        })
+        #print(f">>> uploading {vid_filename} to wandb at step {step_num}...")
+        #wandb.log({
+        #    "eval_step": step_num,
+        #    "render_video": wandb.Video(vid_filename, fps=30, format="mp4")
+        #})
 
         latest_video_path = vid_filename
     else:
@@ -221,9 +265,9 @@ for ckpt_path in checkpoint_paths:
 # =====================================================================
 # AUTOMATIC SUMMARY LOGGING (OVERVIEW PAGE RENDER)
 # =====================================================================
-if latest_video_path and os.path.exists(latest_video_path):
-    print(">>> setting final evaluation render on wandb summary overview...")
-    wandb.run.summary["render_video"] = wandb.Video(latest_video_path, fps=30, format="mp4")
+#if latest_video_path and os.path.exists(latest_video_path):
+#    print(">>> setting final evaluation render on wandb summary overview...")
+#    wandb.run.summary["render_video"] = wandb.Video(latest_video_path, fps=30, format="mp4")
 
-wandb.finish()
+#wandb.finish()
 print("\n>>> All checkpoints evaluated and uploaded successfully!")

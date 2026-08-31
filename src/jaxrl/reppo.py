@@ -942,10 +942,18 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
             if hasattr(fake_args, key) or key in ["clip", "hand", "retarget_name"]:
                 setattr(fake_args, key, value)
                 
-        if "reward_cfg" in env_dict:
-            for k in ["action_penalty", "imi_rew_weight", "contact_rew_weight"]:
-                if k in env_dict["reward_cfg"]:
-                    setattr(fake_args, k, env_dict["reward_cfg"][k])
+        # =================================================================
+        # THE TRULY GENERIC NATIVE INTEGRATION (TRAINING ENV)
+        # =================================================================
+        # This will automatically handle ALL present and future YAML configs!
+        for key, value in env_dict.items():
+            # 1. Always set the top-level key (handles lists like task_rew_betas)
+            setattr(fake_args, key, value)
+            
+            # 2. If it's a dictionary (like reward_cfg), flatten it so the parser can read it
+            if isinstance(value, dict):
+                for sub_k, sub_v in value.items():
+                    setattr(fake_args, sub_k, sub_v)
                     
         setattr(fake_args, "use_retarget_contact", True)
         
@@ -961,10 +969,15 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
         env_kwargs = get_all_env_cfg(fake_args, device='cuda:0')
         
         # =================================================================
-        # 5B. THE SURGICAL BYPASS
+        # 5B. ENVIRONMENT CONFIG INJECTION (TRAINING ENV)
         # =================================================================
-        if "reward_cfg" in env_dict and "force_penalty" in env_dict["reward_cfg"]:
-            env_kwargs["reward_cfg"]["force_penalty"] = env_dict["reward_cfg"]["force_penalty"]
+        # Instead of forcing keys into env_kwargs, we gently update existing ones.
+        for key, value in env_dict.items():
+            if isinstance(value, dict):
+                # Only update dictionaries that BaseEnv actually requested!
+                # This prevents "unexpected keyword argument" crashes.
+                if key in env_kwargs and isinstance(env_kwargs[key], dict):
+                    env_kwargs[key].update(value)
         # =================================================================
         
         raw_dexmachina_env = BaseEnv(**env_kwargs)
@@ -1048,37 +1061,47 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
                 parser = get_common_argparser()
                 eval_fake_args, _ = parser.parse_known_args([]) 
                 
+                # Overwrite defaults with our specific Hydra configs
                 for key_eval, value_eval in eval_env_dict.items():
                     if hasattr(eval_fake_args, key_eval) or key_eval in ["clip", "hand", "retarget_name"]:
                         setattr(eval_fake_args, key_eval, value_eval)
-                        
+                    
                 # =================================================================
-                # COPY NATIVE INTEGRATION TO EVAL ENV
+                # THE TRULY GENERIC NATIVE INTEGRATION (EVAL ENV)
                 # =================================================================
-                if "reward_cfg" in eval_env_dict:
-                    for k in ["action_penalty", "imi_rew_weight", "contact_rew_weight"]:
-                        if k in eval_env_dict["reward_cfg"]:
-                            setattr(eval_fake_args, k, eval_env_dict["reward_cfg"][k])
+                # This will automatically handle ALL present and future YAML configs!
+                for key, value in eval_env_dict.items():
+                    # 1. Always set the top-level key (handles lists like task_rew_betas)
+                    setattr(eval_fake_args, key, value)
+                    
+                    # 2. If it's a dictionary (like reward_cfg), flatten it so the parser can read it
+                    if isinstance(value, dict):
+                        for sub_k, sub_v in value.items():
+                            setattr(eval_fake_args, sub_k, sub_v)
                             
                 setattr(eval_fake_args, "use_retarget_contact", True)
                 
-                # Disarm kill switches for the video renderer too!
+                # Disarm kill switches for the video renderer!
                 setattr(eval_fake_args, "early_reset_threshold", 0.0)
                 setattr(eval_fake_args, "aux_reset_thres", [0.0, 0.0, 0.0])
                 
-                # VERY IMPORTANT: Keep this True so the wrapper unpacks the video loop correctly!
+                # VERY IMPORTANT: Keep this True so the wrapper unpacks correctly!
                 setattr(eval_fake_args, "use_rl_games", True)
                 # =================================================================
                 
                 eval_env_kwargs = get_all_env_cfg(eval_fake_args, device='cuda:0')
                 
                 # =================================================================
-                # COPY SURGICAL BYPASS TO EVAL ENV
+                # THE TRULY GENERIC SURGICAL BYPASS (EVAL ENV)
                 # =================================================================
-                if "reward_cfg" in eval_env_dict and "force_penalty" in eval_env_dict["reward_cfg"]:
-                    eval_env_kwargs["reward_cfg"]["force_penalty"] = eval_env_dict["reward_cfg"]["force_penalty"]
+                # Instead of forcing keys, gently update existing dictionaries that BaseEnv requested
+                for key, value in eval_env_dict.items():
+                    if isinstance(value, dict):
+                        # This prevents "unexpected keyword argument" crashes!
+                        if key in eval_env_kwargs and isinstance(eval_env_kwargs[key], dict):
+                            eval_env_kwargs[key].update(value)
                 # =================================================================
-
+                
                 raw_eval_env = BaseEnv(**eval_env_kwargs)
                 
                 eval_env = DexmachinaGymnaxWrapper(
