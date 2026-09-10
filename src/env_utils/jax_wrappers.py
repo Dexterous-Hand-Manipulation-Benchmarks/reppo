@@ -22,9 +22,16 @@ import torch
 import numpy as np
 import jax.numpy as jnp
 from typing import Dict
-from gymnax.environments.environment import EnvState
+from gymnax.environments.environment import EnvState, EnvParams
 from torch.utils.dlpack import to_dlpack as pt_to_dlpack, from_dlpack as pt_from_dlpack
 from jax.dlpack import to_dlpack as jax_to_dlpack, from_dlpack as jax_from_dlpack
+
+# Import DexMachina specific modules
+import os
+import genesis as gs
+from dexmachina.envs.base_env import BaseEnv
+from dexmachina.envs.constructors import get_all_env_cfg, get_common_argparser
+from omegaconf import OmegaConf
 
 
 class MjxGymnaxWrapper(Environment):
@@ -429,6 +436,11 @@ class DexmachinaGymnaxWrapper(Environment):
         self.env_type = "dexmachina"
         self.max_episode_steps = env.max_episode_length
 
+        # Track steps to compute the current curriculum epoch
+        self._total_host_steps = 0
+        # 1 epoch = 1 rollout horizon (max_episode_steps)
+        self._steps_per_epoch = getattr(env, "max_episode_length", 200)
+
         # Force Genesis to compile its physics kernels on the main thread 
         # before JAX takes over and locks the GPU context.
         print("Warming up Genesis and PyTorch kernels...")
@@ -458,6 +470,27 @@ class DexmachinaGymnaxWrapper(Environment):
             actions_pt = torch.clamp(actions_pt, -self._clip_actions, self._clip_actions)
 
         obs_dict, rew, terminated, truncated, extras = self.env.step(actions_pt)
+
+        # -------------------------------------------------------------
+        # Advance Curriculum Epoch
+        # -------------------------------------------------------------
+        self._total_host_steps += 1
+        if self._total_host_steps % self._steps_per_epoch == 0:
+            current_epoch = self._total_host_steps // self._steps_per_epoch
+            if hasattr(self.env, "set_curriculum"):
+                self.env.set_curriculum(current_epoch)
+
+        # Periodic status check (every 1000 host steps)
+        if self._total_host_steps % 1000 == 1:
+            base_env = getattr(self.env, "unwrapped", self.env)
+            if getattr(base_env, "use_curriculum", False):
+                gains = base_env.curriculum.get_current_gains()
+                print(f"[Curriculum ACTIVE] Step: {self._total_host_steps} | Gains: {gains}")
+            else:
+                act = getattr(getattr(base_env, "object", None), "actuated", False)
+                print(f"[Curriculum OFFLINE] Step: {self._total_host_steps} | actuated: {act}")
+        # -------------------------------------------------------------
+
         obs, critic_obs = self._process_obs(obs_dict)
 
         if obs is None:
@@ -627,3 +660,49 @@ class DexmachinaGymnaxWrapper(Environment):
     def observation_space(self, params=None):
         return Box(low=-float("inf"), high=float("inf"), shape=(self.obs_dim,)), \
                Box(low=-float("inf"), high=float("inf"), shape=(self.state_dim,))
+
+def make_dexmachina_env(cfg_env, cfg_hyperparameters):
+    """Encapsulates all DexMachina config translation and initialization."""
+    _ = jax.devices()
+    gs.init(backend=gs.gpu, logging_level='warning')
+    
+    env_dict = OmegaConf.to_container(cfg_env, resolve=True)
+    parser = get_common_argparser()
+    fake_args, _ = parser.parse_known_args([]) 
+    
+    overrides = {
+        "num_envs": cfg_hyperparameters.num_envs,
+        "horizon": cfg_hyperparameters.max_episode_steps,
+        "learning_rate": cfg_hyperparameters.lr,
+        "max_epochs": cfg_hyperparameters.num_epochs,
+        "use_retarget_contact": True,
+        "early_reset_threshold": 0.0,
+        "aux_reset_thres": [0.0, 0.0, 0.0],
+        "use_rl_games": True,
+        **env_dict, 
+    }
+
+    for key, value in overrides.items():
+        setattr(fake_args, key, value)
+        if isinstance(value, dict):
+            for sub_k, sub_v in value.items():
+                setattr(fake_args, sub_k, sub_v)
+
+    env_kwargs = get_all_env_cfg(fake_args, device='cuda:0')
+
+    for key, value in env_dict.items():
+        if isinstance(value, dict) and isinstance(env_kwargs.get(key), dict):
+            env_kwargs[key].update(value)
+
+    if env_dict.get("curriculum", False):
+        for obj_cfg in env_kwargs.get("object_cfgs", {}).values():
+            if isinstance(obj_cfg, dict):
+                obj_cfg["actuated"] = True
+            else:
+                setattr(obj_cfg, "actuated", True)
+        
+        env_cfg_dict = env_kwargs.setdefault("env_cfg", {})
+        scene_kwargs = env_cfg_dict.setdefault("scene_kwargs", {})
+        scene_kwargs["batch_dofs_info"] = True
+    
+    return BaseEnv(**env_kwargs)
