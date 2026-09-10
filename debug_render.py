@@ -5,9 +5,6 @@ import numpy as np
 # Force JAX to initialize its backends (finding both CPU and GPU)
 _ = jax.devices() 
 
-import genesis as gs
-gs.init(backend=gs.gpu, logging_level='warning')
-
 # Compatibility patch for Orbax and current JAX versions
 if not hasattr(jax.monitoring, 'record_scalar'):
     jax.monitoring.record_scalar = lambda *args, **kwargs: None
@@ -22,9 +19,11 @@ import argparse
 import math
 
 from omegaconf import OmegaConf
-from src.jaxrl.reppo import get_common_argparser, get_all_env_cfg, BaseEnv, make_policy, DexmachinaGymnaxWrapper, ReppoConfig, make_init
+from src.jaxrl.reppo import ReppoConfig, make_init, make_policy
 import orbax.checkpoint as ocp
 from flax.serialization import from_state_dict, to_state_dict
+from dexmachina.envs.constructors import get_all_env_cfg, get_common_argparser
+from src.env_utils.jax_wrappers import LogWrapper, ClipAction, NormalizeVec, DexmachinaGymnaxWrapper, make_dexmachina_env
 
 def get_wandb_run_id(ckpt_dir):
     """Attempt to find the WandB run ID from the Hydra output directory structure."""
@@ -65,85 +64,47 @@ else:
 # =====================================================================
 # WANDB INITIALIZATION (RESUME RUN)
 # =====================================================================
-#run_id = get_wandb_run_id(ckpt_dir)
-#if run_id is None:
-#    print(">>> Warning: Could not auto-detect WandB run ID. WandB will start a new run instead of resuming.")
-#    wandb.init(project=args.wandb_project, name="video_eval")
-#else:
-#    print(f">>> Resuming WandB run ID: {run_id}")
-#    wandb.init(project=args.wandb_project, id=run_id, resume="must")
+wandb_project = args.wandb_project
+if hasattr(hydra_cfg, "wandb") and hasattr(hydra_cfg.wandb, "project"):
+    wandb_project = hydra_cfg.wandb.project
+
+run_id = get_wandb_run_id(ckpt_dir)
+if run_id is None:
+    raise ValueError(f">>> Error: Could not auto-detect WandB run ID from {ckpt_dir}.")
+
+print(f">>> Resuming WandB run ID: {run_id}")
+wandb.init(project=args.wandb_project, id=run_id, resume="must")
 
 # =====================================================================
 # ENVIRONMENT SETUP
 # =====================================================================
-from src.env_utils.jax_wrappers import LogWrapper, ClipAction, NormalizeVec
+# Store original trained_num_envs before overriding for eval
+trained_num_envs = hydra_cfg.hyperparameters.get("num_envs", 512)
+# Override specific parameters for evaluation rendering
+hydra_cfg.hyperparameters.num_envs = 1
 
-env_cfg = hydra_cfg.get("env", hydra_cfg)
+# Ensure evaluation records video using the front camera with a visualizer
+if "env" in hydra_cfg:
+    hydra_cfg.env.num_envs = 1
+    hydra_cfg.env.record_video = True
+    hydra_cfg.env.render_camera = "front"
+    hydra_cfg.env.scene_kwargs = hydra_cfg.env.get("scene_kwargs", {})
+    hydra_cfg.env.scene_kwargs["use_visualizer"] = True
+    hydra_cfg.env.camera_kwargs = {
+        "front": {'res': (256, 256), 'pos': (0.0, -1.6, 2.2), 'lookat': (0.0, -0.1, 1.2), 'fov': 30}
+    }
 
-for key, value in env_cfg.items():
-    if hasattr(args, key) or key in ["clip", "hand", "retarget_name"]:
-        setattr(args, key, value)
-
-args.num_envs = 1 
-args.record_video = True
-args.render_camera = "front"
-args.scene_kwargs = {"use_visualizer": True}
-args.camera_kwargs = {
-    "front": {'res': (256, 256), 'pos': (0.0, -1.6, 2.2), 'lookat': (0.0, -0.1, 1.2), 'fov': 30}
-}
-
-# =================================================================
-# THE TRULY GENERIC NATIVE INTEGRATION
-# =================================================================
-# This will automatically handle ALL present and future YAML configs!
-for key, value in env_cfg.items():
-    # 1. Always set the top-level key (handles lists like task_rew_betas)
-    setattr(args, key, value)
-    
-    # 2. If it's a dictionary (like reward_cfg), flatten it so the parser can read it
-    if isinstance(value, dict):
-        for sub_k, sub_v in value.items():
-            setattr(args, sub_k, sub_v)
-            
-setattr(args, "use_retarget_contact", True)
-
-# Safely bypass the Imitation kill switches!
-setattr(args, "early_reset_threshold", 0.0)
-setattr(args, "aux_reset_thres", [0.0, 0.0, 0.0])
-
-# CRITICAL: Keep this True so the wrapper unpacks the variables correctly!
-setattr(args, "use_rl_games", True)
-# =================================================================
-
-env_kwargs = get_all_env_cfg(args, device='cuda:0')
-
-# =================================================================
-# THE TRULY GENERIC SURGICAL BYPASS
-# =================================================================
-# Instead of forcing keys, gently update existing dictionaries that BaseEnv requested
-for key, value in env_cfg.items():
-    if isinstance(value, dict):
-        # This prevents "unexpected keyword argument" crashes!
-        if key in env_kwargs and isinstance(env_kwargs[key], dict):
-            env_kwargs[key].update(value)
-# =================================================================
-
-raw_env = BaseEnv(**env_kwargs)
-
-base_env = DexmachinaGymnaxWrapper(
-    env=raw_env,
-    clip_obs=env_cfg.get("clip_obs", float("inf")),
-    clip_actions=env_cfg.get("clip_actions", float("inf")),
-    asymmetric_obs=env_cfg.get("asymmetric_obs", True),
-)
+print(">>> Initializing evaluation environment via make_dexmachina_env...")
+base_env = make_dexmachina_env(hydra_cfg.env, hydra_cfg.hyperparameters)
+base_env = DexmachinaGymnaxWrapper(base_env)
 
 # CRITICAL: Sync the evaluation loop safely!
 hp_dict = OmegaConf.to_container(hydra_cfg.hyperparameters, resolve=True)
 hp_dict["max_episode_steps"] = getattr(base_env, "max_episode_steps", hp_dict.get("max_episode_steps", 1000))
 reppo_cfg = ReppoConfig(**hp_dict)
 
-# FIX 1: Apply the exact same wrappers used during training!
-env = LogWrapper(base_env, args.num_envs)
+# Apply the exact same wrappers used during training
+env = LogWrapper(base_env, hydra_cfg.hyperparameters.num_envs)
 env = ClipAction(env)
 if reppo_cfg.normalize_env:
     env = NormalizeVec(env)
@@ -172,7 +133,7 @@ def tile_env_dims(path, x):
     path_str = str(path)
     if "last_" in path_str and isinstance(x, (jnp.ndarray, np.ndarray)):
         if x.ndim > 1 and x.shape[1] == 1:
-            return jnp.repeat(x, reppo_cfg.num_envs, axis=1)
+            return jnp.repeat(x, trained_num_envs, axis=1)
     return x
 
 target_state = jax.tree_util.tree_map_with_path(tile_env_dims, base_train_state)
@@ -183,7 +144,7 @@ target_state = jax.tree_util.tree_map_with_path(tile_env_dims, base_train_state)
 checkpoint_paths = [
     os.path.join(ckpt_dir, d) 
     for d in os.listdir(ckpt_dir) 
-    if os.path.isdir(os.path.join(ckpt_dir, d)) and "checkpoint_step_" in d
+    if os.path.isdir(os.path.join(ckpt_dir, d)) and "checkpoint_seed_" in d
 ]
 
 def extract_step(filename):
@@ -197,8 +158,8 @@ print(f">>> Found {len(checkpoint_paths)} Orbax checkpoints. Beginning evaluatio
 # =====================================================================
 # EVALUATION LOOP
 # =====================================================================
-#wandb.define_metric("eval_step")
-#wandb.define_metric("render_video", step_metric="eval_step")
+wandb.define_metric("eval_step")
+wandb.define_metric("render_video", step_metric="eval_step")
 
 latest_video_path = None
 checkpointer = ocp.StandardCheckpointer()
@@ -252,11 +213,11 @@ for ckpt_path in checkpoint_paths:
         vid_filename = f"eval_video_step_{step_num}.mp4"
         imageio.mimsave(vid_filename, video_array, fps=30)
         
-        #print(f">>> uploading {vid_filename} to wandb at step {step_num}...")
-        #wandb.log({
-        #    "eval_step": step_num,
-        #    "render_video": wandb.Video(vid_filename, fps=30, format="mp4")
-        #})
+        print(f">>> uploading {vid_filename} to wandb at step {step_num}...")
+        wandb.log({
+            "eval_step": step_num,
+            "render_video": wandb.Video(vid_filename, fps=30, format="mp4")
+        })
 
         latest_video_path = vid_filename
     else:
@@ -265,9 +226,9 @@ for ckpt_path in checkpoint_paths:
 # =====================================================================
 # AUTOMATIC SUMMARY LOGGING (OVERVIEW PAGE RENDER)
 # =====================================================================
-#if latest_video_path and os.path.exists(latest_video_path):
-#    print(">>> setting final evaluation render on wandb summary overview...")
-#    wandb.run.summary["render_video"] = wandb.Video(latest_video_path, fps=30, format="mp4")
+if latest_video_path and os.path.exists(latest_video_path):
+    print(">>> setting final evaluation render on wandb summary overview...")
+    wandb.run.summary["render_video"] = wandb.Video(latest_video_path, fps=30, format="mp4")
 
-#wandb.finish()
+wandb.finish()
 print("\n>>> All checkpoints evaluated and uploaded successfully!")
