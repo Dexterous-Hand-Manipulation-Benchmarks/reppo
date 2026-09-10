@@ -18,13 +18,11 @@ from jax import numpy as jnp
 from jax.random import PRNGKey
 from omegaconf import DictConfig, OmegaConf
 
-# Dexmachina imports
+# Logger import
 import os
-import genesis as gs
-from dexmachina.envs.base_env import BaseEnv 
-from dexmachina.envs.constructors import get_all_env_cfg, get_common_argparser
-import argparse
-from omegaconf import OmegaConf
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../logging")))
+from wandb_logger import UniversalLogger
 
 
 # TEMPORARY FIX
@@ -48,6 +46,8 @@ from src.env_utils.jax_wrappers import (
     NormalizeVec,
     DexmachinaGymnaxWrapper,
 )
+from src.env_utils.jax_wrappers import make_dexmachina_env
+
 from src.jaxrl import utils
 from src.networks.jax_models import (
     CategoricalCriticNetwork,
@@ -536,9 +536,9 @@ def make_train_fn(
                         * (critic_update_loss + cfg.aux_loss_mult * aux_loss)
                     )
                     return loss, dict(
-                        value_loss=critic_loss,
+                        critic_loss=critic_loss,
                         critic_update_loss=critic_update_loss,
-                        loss=loss,
+                        critic_total_loss=loss,
                         aux_loss=aux_loss,
                         rew_aux_loss= aux_rew_loss,
                         q=value.mean(),
@@ -632,7 +632,7 @@ def make_train_fn(
 
                     return loss, dict(
                         actor_loss=actor_loss,
-                        loss=loss,
+                        actor_total_loss=loss,
                         temp=actor_model.temperature(),
                         abs_batch_action=jnp.abs(minibatch.action).mean(),
                         abs_pred_action=jnp.abs(pred_action).mean(),
@@ -881,27 +881,29 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
             sps = 0
 
         metric_history.append(metrics)
-        episode_return = metrics["eval/episode_return"].mean()
-        eval_length = metrics["eval/episode_length"].mean()
-        logging.info(
-            f"step={state.time_steps[0]} episode_return={episode_return:.3f}, episode_length={eval_length:.3f} sps={sps:.2f}"
-        )
-        log_data = {
-            "eval/episode_return": episode_return,
-            "eval/episode_length": eval_length,
-            **jax.tree.map(jnp.mean, utils.filter_prefix("train", metrics)),
-        }
-        wandb.log(log_data, step=state.time_steps[0])
-
-        # SAVE CHECKPOINT 
-
-        checkpointer.wait_until_finished()
         
-        current_step = int(state.time_steps[0].item())
-        ckpt_path = os.path.abspath(os.path.join(ckpt_dir, f"checkpoint_step_{current_step}"))
+        # 1. Average ALL raw metrics from JAX natively
+        log_data = jax.tree.map(jnp.mean, metrics)
+        log_data["perf/fps"] = sps
 
-        # Save in the background and instantly return to training!
-        checkpointer.save(ckpt_path, state)
+        # 2. Terminal output
+        logging.info(
+            f"step={state.time_steps[0]} "
+            f"episode_return={log_data.get('eval/episode_return', 0):.3f}, "
+            f"episode_length={log_data.get('eval/episode_length', 0):.3f} sps={sps:.2f}"
+        )
+
+        wandb.log(log_data, step=state.time_steps[0])
+        
+        # SAVE CHECKPOINT 
+        checkpointer.wait_until_finished()
+        current_step = int(state.time_steps[0].item())
+        
+        # Append the seed to prevent trials from colliding!
+        ckpt_path = os.path.abspath(os.path.join(ckpt_dir, f"checkpoint_seed_{cfg.seed}_step_{current_step}"))
+
+        # Add force=True so Orbax gracefully overwrites if XLA retries the callback
+        checkpointer.save(ckpt_path, state, force=True)
         logging.info(f"Checkpoint successfully saved to {ckpt_path}")
 
     # Set up the experiment
@@ -921,75 +923,14 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
             asymmetric_observation=cfg.env.get("asymmetric_obs", False),
         )
     elif cfg.env.type == "dexmachina":       
-        _ = jax.devices()
-        gs.init(backend=gs.gpu, logging_level='warning')
-        
-        # 1. Convert Hydra configs to a flat dictionary
-        env_dict = OmegaConf.to_container(cfg.env, resolve=True)
-        
-        # 2. Inject shared REPPO hyperparameters
-        env_dict["num_envs"] = cfg.hyperparameters.num_envs
-        env_dict["horizon"] = cfg.hyperparameters.max_episode_steps
-        env_dict["learning_rate"] = cfg.hyperparameters.lr
-        env_dict["max_epochs"] = cfg.hyperparameters.num_epochs 
-
-        # 3. Get the actual DexMachina parser and load defaults
-        parser = get_common_argparser()
-        fake_args, _ = parser.parse_known_args([]) 
-        
-        # 4. Overwrite the defaults with our specific Hydra configs
-        for key, value in env_dict.items():
-            if hasattr(fake_args, key) or key in ["clip", "hand", "retarget_name"]:
-                setattr(fake_args, key, value)
-                
-        # =================================================================
-        # THE TRULY GENERIC NATIVE INTEGRATION (TRAINING ENV)
-        # =================================================================
-        # This will automatically handle ALL present and future YAML configs!
-        for key, value in env_dict.items():
-            # 1. Always set the top-level key (handles lists like task_rew_betas)
-            setattr(fake_args, key, value)
-            
-            # 2. If it's a dictionary (like reward_cfg), flatten it so the parser can read it
-            if isinstance(value, dict):
-                for sub_k, sub_v in value.items():
-                    setattr(fake_args, sub_k, sub_v)
-                    
-        setattr(fake_args, "use_retarget_contact", True)
-        
-        # Safely bypass the Imitation kill switches!
-        setattr(fake_args, "early_reset_threshold", 0.0)
-        setattr(fake_args, "aux_reset_thres", [0.0, 0.0, 0.0])
-        
-        # THE FIX: Leave this True so the wrapper unpacks the variables correctly!
-        setattr(fake_args, "use_rl_games", True)
-        # =================================================================
-
-        # 5. Build BaseEnv 
-        env_kwargs = get_all_env_cfg(fake_args, device='cuda:0')
-        
-        # =================================================================
-        # 5B. ENVIRONMENT CONFIG INJECTION (TRAINING ENV)
-        # =================================================================
-        # Instead of forcing keys into env_kwargs, we gently update existing ones.
-        for key, value in env_dict.items():
-            if isinstance(value, dict):
-                # Only update dictionaries that BaseEnv actually requested!
-                # This prevents "unexpected keyword argument" crashes.
-                if key in env_kwargs and isinstance(env_kwargs[key], dict):
-                    env_kwargs[key].update(value)
-        # =================================================================
-        
-        raw_dexmachina_env = BaseEnv(**env_kwargs)
-        
         env = DexmachinaGymnaxWrapper(
-            env=raw_dexmachina_env,
+            env=make_dexmachina_env(cfg.env, cfg.hyperparameters),
             clip_obs=cfg.env.get("clip_obs", math.inf),
             clip_actions=cfg.env.get("clip_actions", math.inf),
             asymmetric_obs=cfg.env.get("asymmetric_obs", True),
         )
         
-        # Sync your RL algorithm to match the human clip length!
+        # Sync your reppo to match the human clip length
         cfg.hyperparameters.max_episode_steps = env.max_episode_steps
 
     else:
@@ -1003,6 +944,17 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
         log_callback=log_callback,
         num_seeds=cfg.num_seeds,
         reward_scale=1.0 / cfg.env.reward_scaling,
+    )
+
+    # INSTALL UNIVERSAL LOGGER ONCE OUTSIDE THE LOOP
+    UniversalLogger.install(
+        algo=cfg.get("name", "reppo"),
+        hand=cfg.env.get("hand", "allegro_hand"),
+        clip=cfg.env.get("clip", "box-30-230"),
+        seed=cfg.seed,
+        num_envs=cfg.hyperparameters.num_envs,
+        horizon_length=cfg.hyperparameters.num_steps,
+        keep_model_specific=True,
     )
 
     for i in range(completed_trials, cfg.num_trials):
@@ -1020,7 +972,7 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
                 *cfg.tags,
             ],
             config=OmegaConf.to_container(cfg),
-            name=f"{cfg.name}-{cfg.env.name.lower()}",
+            name=cfg.get("exp_name", f"{cfg.name}-{cfg.env.name.lower()}"),
             save_code=True,
         )
 
@@ -1038,139 +990,7 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
         logging.info(f"Training took {duration:.2f} seconds.")
         jnp.savez("metrics.npz", **metrics)
 
-        # Generate one final video for results confirmation
-        if cfg.env.type == "dexmachina":
-            print("\n>>> Starting Video Evaluation Render...", flush=True)
-            try:
-                # 1. Build a 1-Env config specifically for rendering
-                eval_env_dict = OmegaConf.to_container(cfg.env, resolve=True)
-                eval_env_dict["num_envs"] = 1
-                eval_env_dict["horizon"] = cfg.hyperparameters.max_episode_steps
-                
-                # Inject visualizer and camera kwargs
-                eval_env_dict["record_video"] = True
-                eval_env_dict["render_camera"] = "front"
-                eval_env_dict["scene_kwargs"] = eval_env_dict.get("scene_kwargs", {})
-                eval_env_dict["scene_kwargs"]["use_visualizer"] = True
-                if "camera_kwargs" not in eval_env_dict or not eval_env_dict["camera_kwargs"]:
-                    eval_env_dict["camera_kwargs"] = {
-                        "front": {'res': (256, 256), 'pos': (0.0, -1.6, 2.2), 'lookat': (0.0, -0.1, 1.2), 'fov': 30}
-                    }
-
-                # 2. Build the eval environment
-                parser = get_common_argparser()
-                eval_fake_args, _ = parser.parse_known_args([]) 
-                
-                # Overwrite defaults with our specific Hydra configs
-                for key_eval, value_eval in eval_env_dict.items():
-                    if hasattr(eval_fake_args, key_eval) or key_eval in ["clip", "hand", "retarget_name"]:
-                        setattr(eval_fake_args, key_eval, value_eval)
-                    
-                # =================================================================
-                # THE TRULY GENERIC NATIVE INTEGRATION (EVAL ENV)
-                # =================================================================
-                # This will automatically handle ALL present and future YAML configs!
-                for key, value in eval_env_dict.items():
-                    # 1. Always set the top-level key (handles lists like task_rew_betas)
-                    setattr(eval_fake_args, key, value)
-                    
-                    # 2. If it's a dictionary (like reward_cfg), flatten it so the parser can read it
-                    if isinstance(value, dict):
-                        for sub_k, sub_v in value.items():
-                            setattr(eval_fake_args, sub_k, sub_v)
-                            
-                setattr(eval_fake_args, "use_retarget_contact", True)
-                
-                # Disarm kill switches for the video renderer!
-                setattr(eval_fake_args, "early_reset_threshold", 0.0)
-                setattr(eval_fake_args, "aux_reset_thres", [0.0, 0.0, 0.0])
-                
-                # VERY IMPORTANT: Keep this True so the wrapper unpacks correctly!
-                setattr(eval_fake_args, "use_rl_games", True)
-                # =================================================================
-                
-                eval_env_kwargs = get_all_env_cfg(eval_fake_args, device='cuda:0')
-                
-                # =================================================================
-                # THE TRULY GENERIC SURGICAL BYPASS (EVAL ENV)
-                # =================================================================
-                # Instead of forcing keys, gently update existing dictionaries that BaseEnv requested
-                for key, value in eval_env_dict.items():
-                    if isinstance(value, dict):
-                        # This prevents "unexpected keyword argument" crashes!
-                        if key in eval_env_kwargs and isinstance(eval_env_kwargs[key], dict):
-                            eval_env_kwargs[key].update(value)
-                # =================================================================
-                
-                raw_eval_env = BaseEnv(**eval_env_kwargs)
-                
-                eval_env = DexmachinaGymnaxWrapper(
-                    env=raw_eval_env,
-                    clip_obs=cfg.env.get("clip_obs", math.inf),
-                    clip_actions=cfg.env.get("clip_actions", math.inf),
-                    asymmetric_obs=cfg.env.get("asymmetric_obs", True),
-                )
-
-                # 3. Rollout loop in standard Python using your script's native policy
-                frames = []
-                eval_key = jax.random.PRNGKey(0)
-                obs, critic_obs, env_state = eval_env.reset(key=eval_key)
-                
-                # Handle multi-seed vs single-seed outputs from runner_state
-                final_train_state = jax.tree.map(
-                    lambda x: x[0] if getattr(x, 'ndim', 0) > 0 and x.shape[0] == cfg.num_seeds else x, 
-                    runner_state
-                )
-                
-                # Extract Normalization Stats!
-                if cfg.hyperparameters.normalize_env and hasattr(final_train_state.last_env_state, 'mean'):
-                    obs_mean = final_train_state.last_env_state.mean
-                    obs_var = final_train_state.last_env_state.var
-                    if obs_mean.ndim > 1:
-                        obs_mean = obs_mean[0]
-                        obs_var = obs_var[0]
-                else:
-                    obs_mean, obs_var = 0.0, 1.0
-                
-                # Create the policy using your script's native make_policy function
-                policy = make_policy(final_train_state)
-
-                for step_idx in range(cfg.hyperparameters.max_episode_steps):
-                    eval_key, act_key, step_key = jax.random.split(eval_key, 3)
-                    
-                    # Manually normalize the observation before passing to policy
-                    # Needed because we dont call the normalization from make_train_fn here
-                    if cfg.hyperparameters.normalize_env:
-                        norm_obs = (obs - obs_mean) / jnp.sqrt(obs_var + 1e-8)
-                    else:
-                        norm_obs = obs
-                    
-                    # Get the deterministic action from your trained network
-                    action_jax, _ = policy(act_key, norm_obs)
-                    
-                    obs, critic_obs, env_state, reward, done, info = eval_env.step(
-                        step_key, env_state, action_jax
-                    )
-                    
-                    # Grab frame from wrapper
-                    frame = eval_env.render()
-                    if frame is not None:
-                        frames.append(frame)
-                    
-                # 4. Process and upload to WandB
-                if frames:
-                    frames_np = np.array(frames)
-                    if frames_np.ndim == 5:
-                        frames_np = frames_np.squeeze(1)
-                    
-                    # WandB requires (Time, Channels, Height, Width)
-                    frames_np = np.transpose(frames_np, (0, 3, 1, 2)) 
-                    
-                    wandb.log({"eval/video": wandb.Video(frames_np, fps=30, format="mp4")})
-                    print(">>> Video successfully uploaded to WandB!", flush=True)
-                    
-            except Exception as e:
-                print(f"Warning: Video rendering failed: {e}", flush=True)
+        checkpointer.wait_until_finished()
 
         wandb.finish()
 
