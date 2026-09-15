@@ -45,6 +45,10 @@ from src.env_utils.jax_wrappers import (
     MjxGymnaxWrapper,
     NormalizeVec,
     DexmachinaGymnaxWrapper,
+    DEX_EXTRA_LOG_KEYS,
+    DEX_GAIN_KEYS,
+    DEX_ADD_KEY,
+    DEX_ADD_THRESHOLDS,
 )
 from src.env_utils.jax_wrappers import make_dexmachina_env
 
@@ -179,7 +183,7 @@ def make_eval_fn(
             length=max_episode_steps,
         )
 
-        return {
+        result = {
             "episode_return": infos["returned_episode_returns"].mean(
                 where=infos["returned_episode"]
             )
@@ -195,6 +199,31 @@ def make_eval_fn(
             ),
             "num_episodes": infos["returned_episode"].sum(),
         }
+        # DexMachina per-step diagnostics, CURATED. The env forwards ~54 keys
+        # (see discover_dex_log_keys) and those all reach wandb as env/* from the
+        # TRAINING env; eval deliberately reports only the headline subset so the
+        # eval namespace stays readable. Plain per-step mean over the whole eval
+        # rollout, not episode-masked.
+        for key in DEX_EXTRA_LOG_KEYS:
+            if key in DEX_GAIN_KEYS or key in result:
+                continue  # eval env is permanently unassisted -> gains always 0
+            if key in infos:
+                result[key] = infos[key].mean()
+
+        # ADD-AUC over the whole eval rollout: area under the
+        # accuracy-vs-threshold curve, x normalised to [0, 1] so the result is
+        # in [0, 1] and matches dexmachina/eval/compute_add.py's compute_auc.
+        # infos[DEX_ADD_KEY] is (max_episode_steps, num_envs) in metres.
+        if DEX_ADD_KEY in infos:
+            add_vals = infos[DEX_ADD_KEY]
+            thresholds = jnp.asarray(DEX_ADD_THRESHOLDS)
+            acc = jnp.mean(add_vals[None, ...] < thresholds[:, None, None], axis=(1, 2))
+            x = jnp.linspace(0.0, 1.0, len(DEX_ADD_THRESHOLDS))
+            result["add_auc"] = jnp.sum((acc[1:] + acc[:-1]) / 2.0 * jnp.diff(x))
+            # a couple of individual operating points, easier to read than AUC
+            for thres in (0.01, 0.02, 0.05):
+                result[f"add_success_{int(thres * 100)}cm"] = jnp.mean(add_vals < thres)
+        return result
 
     return evaluation_fn
 
@@ -332,6 +361,7 @@ def make_train_fn(
     log_callback: Callable[[SACTrainState, dict[str, jax.Array]], None] | None = None,
     num_seeds: int = 1,
     reward_scale: float = 1.0,
+    eval_env: Environment | None = None,
 ):
     env_params = env_params  # or env.default_params
     env = LogWrapper(env, cfg.num_envs)
@@ -339,7 +369,20 @@ def make_train_fn(
     # env = VecEnv(env, cfg.num_envs)
     if cfg.normalize_env:
         env = NormalizeVec(env)
-    eval_fn = make_eval_fn(env, cfg.max_episode_steps, reward_scale=reward_scale)
+
+    # Evaluation runs on its own env instance when one is supplied, so eval no
+    # longer resets the training simulator out from under the rollout. It gets
+    # the same wrapper stack; NormalizeVec.reset() takes the TRAINING statistics
+    # via the norm_state passed into evaluation_fn, so normalisation still
+    # matches what the policy saw while learning.
+    if eval_env is not None:
+        eval_stack = LogWrapper(eval_env, eval_env.num_envs)
+        eval_stack = ClipAction(eval_stack)
+        if cfg.normalize_env:
+            eval_stack = NormalizeVec(eval_stack)
+    else:
+        eval_stack = env
+    eval_fn = make_eval_fn(eval_stack, cfg.max_episode_steps, reward_scale=reward_scale)
     action_size_target = (
         jnp.prod(jnp.array(env.action_space(env_params).shape)) * cfg.ent_target_mult
     )
@@ -734,6 +777,20 @@ def make_train_fn(
                     "returned_episode_lengths"
                 ].mean(),
             }
+            # Every DexMachina diagnostic the env forwarded, live from the
+            # TRAINING env, logged as env/* to match the panel names FastTD3
+            # produces. Previously only the two episode stats above reached
+            # wandb from this path, so the curriculum gains and all the reward
+            # breakdowns were invisible during training.
+            _info = train_state.last_env_state.info
+            _skip = {
+                "returned_episode", "returned_episode_returns",
+                "returned_episode_lengths", "timestep", "truncation", "steps",
+            }
+            for _k in sorted(_info):
+                if _k in _skip:
+                    continue
+                train_returns[f"env/{_k}"] = _info[_k].mean()
             metrics = {
                 "time_step": train_state.time_steps,
                 **utils.prefix_dict("train", train_metrics),
@@ -857,6 +914,9 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
     metric_history = []
 
     import orbax.checkpoint as ocp
+    import absl.logging
+
+    absl.logging.set_verbosity(absl.logging.WARNING)
     
     ckpt_dir = cfg.get("checkpoint_dir", "checkpoints")
     if ckpt_dir is None:
@@ -907,6 +967,7 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
         logging.info(f"Checkpoint successfully saved to {ckpt_path}")
 
     # Set up the experiment
+    eval_env = None
     if cfg.env.type == "brax":
         env = BraxGymnaxWrapper(
             cfg.env.name,
@@ -925,11 +986,34 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
     elif cfg.env.type == "dexmachina":       
         env = DexmachinaGymnaxWrapper(
             env=make_dexmachina_env(cfg.env, cfg.hyperparameters),
+            num_steps=cfg.hyperparameters.num_steps,
+            episode_length=cfg.env.get("max_episode_steps", None),
             clip_obs=cfg.env.get("clip_obs", math.inf),
             clip_actions=cfg.env.get("clip_actions", math.inf),
             asymmetric_obs=cfg.env.get("asymmetric_obs", True),
+            curriculum_max_epochs=cfg.env.get("curriculum_max_epochs", 10000),
+            total_env_steps=cfg.hyperparameters.total_time_steps,
         )
-        
+
+        # Separate, smaller evaluation env (see make_dexmachina_env(eval_mode=True)).
+        num_eval_envs = int(cfg.env.get("num_eval_envs", 256))
+        print(f"[EVAL ENV] building a separate eval env with {num_eval_envs} envs")
+        eval_env = DexmachinaGymnaxWrapper(
+            env=make_dexmachina_env(
+                cfg.env, cfg.hyperparameters, eval_mode=True, num_envs=num_eval_envs
+            ),
+            num_steps=cfg.hyperparameters.num_steps,
+            episode_length=cfg.env.get("max_episode_steps", None),
+            clip_obs=cfg.env.get("clip_obs", math.inf),
+            clip_actions=cfg.env.get("clip_actions", math.inf),
+            asymmetric_obs=cfg.env.get("asymmetric_obs", True),
+            # advance_curriculum=False is now the ONLY thing marking this as the
+            # eval wrapper: it gates the epoch counter and the training-side [DBG]
+            # prints. Unassisted physics and curriculum bookkeeping are handled at
+            # env construction (make_dexmachina_env eval_mode=True).
+            advance_curriculum=False,
+        )
+
         # Sync your reppo to match the human clip length
         cfg.hyperparameters.max_episode_steps = env.max_episode_steps
 
@@ -944,6 +1028,7 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
         log_callback=log_callback,
         num_seeds=cfg.num_seeds,
         reward_scale=1.0 / cfg.env.reward_scaling,
+        eval_env=eval_env,
     )
 
     # INSTALL UNIVERSAL LOGGER ONCE OUTSIDE THE LOOP

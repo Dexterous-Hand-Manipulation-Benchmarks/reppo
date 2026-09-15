@@ -33,6 +33,96 @@ from dexmachina.envs.base_env import BaseEnv
 from dexmachina.envs.constructors import get_all_env_cfg, get_common_argparser
 from omegaconf import OmegaConf
 
+# Fixed set of per-step diagnostic keys pulled from DexMachina's `extras["log"]`
+# dict and threaded through the JAX wrapper stack as ordinary `info` entries
+# (e.g. reach wandb as "eval/pos_dist", "eval/con_rew", ...). Kept as an
+# explicit, static list (rather than forwarding `extras["log"]` verbatim)
+# because `io_callback` and the LogWrapper/NormalizeVec carry state need a
+# fixed pytree structure known at JAX-trace time.
+DEX_EXTRA_LOG_KEYS = (
+    "pos_dist",
+    "rot_dist",
+    "arti_dist",
+    "task_rew",
+    "con_rew",
+    "imi_rew",
+    "bc_rew",
+    "keypoint_dist",
+    "well_track",
+    "success_2cm",
+    "success_5cm",
+    # ADD (mean per-vertex distance to the demo pose, metres), per object part.
+    # Same definition as dexmachina/eval/compute_add.py. Requires
+    # env.log_add_metric=true.
+    "add",
+    "add_top",
+    "add_bottom",
+    # Contact diagnostics (see RewardModule.compute_matched_contact_reward):
+    # con_rew is bounded above by con_rew_ceiling, which depends on how many
+    # (part, link) pairs the demo actually wants in contact. Compare con_rew
+    # against the ceiling, not against contact_rew_weight.
+    "con_active_frac",
+    "con_dist_active",
+    "con_rew_ceiling",
+    # Curriculum assistive gains, from Curriculum.get_current_gains(). These are
+    # scalars broadcast to every env by _host_step. Logged from the TRAINING env
+    # only (see DEX_GAIN_KEYS) -- the eval env has them permanently zeroed, so an
+    # eval/kp panel would be a flat zero line.
+    "kp",
+    "kv",
+    "fr",
+    "kp_lower",
+    "kv_lower",
+    "fr_lower",
+)
+
+# Subset of the above that describes the curriculum's assistive gains rather than
+# the policy's behaviour. Logged as env/* from the training env to match the panel
+# names FastTD3 produces (its logger maps raw "kp" -> "env/kp"), and skipped in
+# evaluation_fn.
+DEX_GAIN_KEYS = ("kp", "kv", "fr", "kp_lower", "kv_lower", "fr_lower")
+
+# Entries in extras["log"] that CANNOT be forwarded: `episode_rew` is
+# `cumulative_task_rew[reset_env_ids]`, so it has shape (n_reset,) and is only
+# present on steps where something reset -- both the varying length and the
+# intermittency break the io_callback's fixed output structure.
+DEX_LOG_KEY_BLOCKLIST = frozenset({"episode_rew"})
+
+
+def discover_dex_log_keys(base_env, num_envs):
+    """Every per-env / scalar entry the env publishes in extras["log"].
+
+    RewardModule generates several keys by f-string (conrew_{side}_{part},
+    matched_condist_{side}_{part}, {side}_control_force, grad/{term}), so a
+    hardcoded list goes stale whenever the reward config changes. Read them off a
+    real post-warmup step instead. DEX_EXTRA_LOG_KEYS is unioned in so the
+    known-good set is always present even if discovery comes up short.
+    """
+    found = set()
+    log = getattr(base_env, "extras", {}).get("log", {}) or {}
+    for key, val in log.items():
+        if key in DEX_LOG_KEY_BLOCKLIST:
+            continue
+        if isinstance(val, torch.Tensor):
+            if val.ndim == 0 or val.shape[0] == num_envs:
+                found.add(key)
+        elif isinstance(val, (int, float, bool)):
+            found.add(key)
+    keys = tuple(sorted(found | set(DEX_EXTRA_LOG_KEYS)))
+    skipped = sorted(set(log) - found - DEX_LOG_KEY_BLOCKLIST)
+    print(f"[ENV] forwarding {len(keys)} extras['log'] keys to wandb")
+    if skipped:
+        print(f"[ENV] skipped (shape not per-env): {skipped}")
+    return keys
+
+# Subset of the above that ADD-AUC is computed from during eval.
+DEX_ADD_KEY = "add"
+
+# Thresholds (metres) for the ADD accuracy-vs-threshold curve whose area is the
+# reported AUC. Kept identical to dexmachina/eval/compute_add.py's
+# np.arange(0.01, 0.1, 0.01) so online and offline numbers line up.
+DEX_ADD_THRESHOLDS = (0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09)
+
 
 class MjxGymnaxWrapper(Environment):
     def __init__(
@@ -161,6 +251,13 @@ class LogWrapper(Wrapper):
     @partial(jax.jit, static_argnums=(0,))
     def reset(self, key) -> Tuple[chex.Array, environment.EnvState]:
         obs, critic_obs, env_state = self.env.reset(key)
+        # some wrapped envs (e.g. DexmachinaGymnaxWrapper) add extra fixed-shape
+        # scalar-per-env keys into `info` on every step() call (see
+        # `extra_log_keys` / DEX_EXTRA_LOG_KEYS in jax_wrappers.py). Seed matching
+        # zero placeholders here so `state.info`'s pytree structure stays
+        # identical between reset() and every subsequent step() - required
+        # since `state` is carried through jax.lax.scan.
+        extra_keys = getattr(self.env, "extra_log_keys", ())
         state = LogEnvState(
             env_state=env_state,
             episode_returns=jnp.zeros((self.num_envs,)),
@@ -176,6 +273,7 @@ class LogWrapper(Wrapper):
                 "returned_episode_lengths": jnp.zeros(
                     (self.num_envs,), dtype=jnp.int32
                 ),
+                **{k: jnp.zeros((self.num_envs,), dtype=jnp.float32) for k in extra_keys},
             },
         )
         return obs, critic_obs, state
@@ -418,9 +516,14 @@ class DexmachinaGymnaxWrapper(Environment):
     def __init__(
         self,
         env,
+        num_steps: int,
+        episode_length: int | None = None,
         clip_obs: float = math.inf,
         clip_actions: float = math.inf,
         asymmetric_obs: bool = True,
+        curriculum_max_epochs: int = 10000,
+        total_env_steps: int = 0,
+        advance_curriculum: bool = True,
     ):
         super().__init__()
         self.env = env
@@ -434,12 +537,64 @@ class DexmachinaGymnaxWrapper(Environment):
         self.asymmetric_obs = asymmetric_obs
 
         self.env_type = "dexmachina"
-        self.max_episode_steps = env.max_episode_length
+        # DexMachina already derives the horizon from the clip string:
+        # constructors.py does `ep_len = end - start` (box-30-230 -> 200,
+        # mixer-0-150 -> 150) and stores it as env_cfg['episode_length'].
+        # Prefer that over any configured value so switching clips does not
+        # silently run a wrong-length eval rollout.
+        env_ep_len = int(getattr(env, "max_episode_length", 0) or 0)
+        if episode_length is None:
+            if env_ep_len <= 0:
+                raise ValueError(
+                    "max_episode_steps not given and the env exposes no "
+                    "max_episode_length to derive it from."
+                )
+            self.max_episode_steps = env_ep_len
+        else:
+            self.max_episode_steps = int(episode_length)
+            if env_ep_len > 0 and env_ep_len != self.max_episode_steps:
+                print(
+                    f"[ENV] WARNING: configured max_episode_steps="
+                    f"{self.max_episode_steps} != the clip's own length "
+                    f"{env_ep_len}; using the clip's. Set max_episode_steps: null "
+                    f"to derive it automatically."
+                )
+                self.max_episode_steps = env_ep_len
+        print(f"[ENV] max_episode_steps = {self.max_episode_steps} (from clip)")
+        # exposed so LogWrapper.reset() can seed matching zero placeholders
+        # for these keys in its carried `state.info` (see DEX_EXTRA_LOG_KEYS)
+        self.extra_log_keys = DEX_EXTRA_LOG_KEYS
 
-        # Track steps to compute the current curriculum epoch
+        # ------------------------------------------------------------------
+        # Curriculum epoch counter.
+        #
+        # This used to be `epoch = total_host_steps // num_steps`, i.e. one epoch
+        # per rollout. With num_steps=32 that gave only 762 epochs across a 50M
+        # step run, and DexMachina's curriculum is denominated in epochs:
+        # wait_epochs=100, a hardcoded 40-epoch minimum between decays, and
+        # zero_epoch. 762 epochs allows at most ~19 decays; 152 (a 10M run)
+        # allows 3, so the curriculum could never actually run.
+        #
+        # FastTD3 instead maps training progress linearly onto a fixed epoch
+        # budget (fast_td3/train.py: `epoch = global_step * max_epochs //
+        # total_timesteps`), so the counter always ticks max_epochs times
+        # regardless of rollout length. Mirror that: the epoch-denominated
+        # curriculum parameters then mean the same thing they do for them.
+        # ------------------------------------------------------------------
         self._total_host_steps = 0
-        # 1 epoch = 1 rollout horizon (max_episode_steps)
-        self._steps_per_epoch = getattr(env, "max_episode_length", 200)
+        self._curriculum_max_epochs = int(curriculum_max_epochs)
+        # one host step advances every env by one step
+        self._host_steps_total = max(1, int(total_env_steps) // max(1, self.num_envs))
+        self._current_epoch = -1
+        # Offline tools (debug_render.py) set the gains explicitly per checkpoint
+        # and must NOT have the schedule advanced underneath them. They also run
+        # at num_envs=1 with no total_env_steps, which would make the progress
+        # ratio explode. Refuse to drive the curriculum unless we were actually
+        # told how long the run is.
+        self._advance_curriculum = bool(advance_curriculum) and int(total_env_steps) > 0
+        if bool(advance_curriculum) and int(total_env_steps) <= 0:
+            print("[CURR] total_env_steps not provided; curriculum advancement disabled.")
+
 
         # Force Genesis to compile its physics kernels on the main thread 
         # before JAX takes over and locks the GPU context.
@@ -449,6 +604,13 @@ class DexmachinaGymnaxWrapper(Environment):
         self.env.step(dummy_actions)
         torch.cuda.synchronize()
         print("Genesis warmup complete!")
+
+        # extras["log"] is populated now, so the forwarded key set can be read
+        # off the real env rather than hardcoded. Must happen before JAX traces
+        # anything, since it fixes the io_callback's output width.
+        self.extra_log_keys = discover_dex_log_keys(
+            getattr(self.env, "unwrapped", self.env), self.num_envs
+        )
 
     # ---------------------------------------------------------
     # HOST FUNCTIONS (Run standard PyTorch + DLPack outside JIT)
@@ -472,23 +634,42 @@ class DexmachinaGymnaxWrapper(Environment):
         obs_dict, rew, terminated, truncated, extras = self.env.step(actions_pt)
 
         # -------------------------------------------------------------
-        # Advance Curriculum Epoch
+        # Advance the curriculum epoch. `_advance_curriculum` is a per-instance
+        # property: True on the training wrapper, False on the evaluation wrapper
+        # and on debug_render's. Evaluation used to share this env and so needed a
+        # per-call `is_eval` flag threaded through every wrapper's step() and into
+        # the io_callback; with a dedicated eval env that distinction is fixed at
+        # construction time.
         # -------------------------------------------------------------
-        self._total_host_steps += 1
-        if self._total_host_steps % self._steps_per_epoch == 0:
-            current_epoch = self._total_host_steps // self._steps_per_epoch
-            if hasattr(self.env, "set_curriculum"):
-                self.env.set_curriculum(current_epoch)
+        if self._advance_curriculum:
+            self._total_host_steps += 1
+        epoch = (
+            self._total_host_steps * self._curriculum_max_epochs
+        ) // self._host_steps_total
+        if self._advance_curriculum and epoch > self._current_epoch:
+            self._current_epoch = epoch
+            self.env.set_curriculum(epoch)          # ignore the bool
+            c = self.env.curriculum
+            if epoch % 500 == 0:
+                _, reason = c.determine_decay(epoch)   # read-only, safe to call
+                print(f"[Curriculum] epoch={epoch} gains={c.get_current_gains()} "
+                    f"deques={ {k: len(v) for k, v in c.rew_deques.items()} } "
+                    f"ep_lens={len(c.ep_lens)} since_decay={c.num_epoch_since_last_decay} "
+                    f"| {reason}")
 
         # Periodic status check (every 1000 host steps)
-        if self._total_host_steps % 1000 == 1:
-            base_env = getattr(self.env, "unwrapped", self.env)
-            if getattr(base_env, "use_curriculum", False):
-                gains = base_env.curriculum.get_current_gains()
-                print(f"[Curriculum ACTIVE] Step: {self._total_host_steps} | Gains: {gains}")
-            else:
-                act = getattr(getattr(base_env, "object", None), "actuated", False)
-                print(f"[Curriculum OFFLINE] Step: {self._total_host_steps} | actuated: {act}")
+        base = getattr(self.env, "unwrapped", self.env)
+        if self._advance_curriculum and self._total_host_steps % 100 == 1:
+            n_nan = base.nan_envs.sum().item()
+            print(f"[DBG] nan_envs={n_nan}/{base.num_envs} "
+                f"ep_len_mean={base.episode_length_buf.float().mean().item():.1f} "
+                f"obj_z_min={base.object.root_pos[:,2].min().item():.3f}")
+            if n_nan > 0:
+                for side in ['left', 'right']:
+                    r = base.robots[side]
+                    print(f"   {side}: nan={r.get_nan_envs().sum().item()} "
+                        f"|qpos|max={r.entity.get_dofs_position().abs().max().item():.2f}")
+                print(f"   obj: nan={base.object.get_nan_envs().sum().item()}")
         # -------------------------------------------------------------
 
         obs, critic_obs = self._process_obs(obs_dict)
@@ -517,6 +698,37 @@ class DexmachinaGymnaxWrapper(Environment):
         else:
             truncated = truncated.to(torch.bool)
 
+        # -------------------------------------------------------------
+        # Pull the fixed set of DEX_EXTRA_LOG_KEYS out of extras["log"] into a
+        # single (num_envs, K) tensor - missing keys (e.g. a reward term that's
+        # disabled this run) fall back to zeros rather than changing shape, so
+        # the io_callback's output structure stays fixed across the whole run.
+        # -------------------------------------------------------------
+        log = extras.get("log", {}) if isinstance(extras, dict) else {}
+        extra_cols = []
+        for key in self.extra_log_keys:
+            val = log.get(key, None)
+            if val is None:
+                col = torch.zeros(self.num_envs, dtype=torch.float32, device='cuda:0')
+            elif isinstance(val, torch.Tensor):
+                val = val.to(torch.float32)
+                if val.ndim > 0 and val.shape[0] != self.num_envs:
+                    # shape changed since discovery -- log zeros rather than
+                    # crashing the whole run inside an io_callback
+                    col = torch.zeros(self.num_envs, dtype=torch.float32, device='cuda:0')
+                    extra_cols.append(col)
+                    continue
+                if val.ndim > 1 and val.shape[0] == self.num_envs:
+                    # per-env but with trailing dims (e.g. per-link distances):
+                    # average them down rather than raising in reshape()
+                    col = val.reshape(self.num_envs, -1).mean(dim=-1)
+                else:
+                    col = val.reshape(self.num_envs)
+            else:
+                col = torch.full((self.num_envs,), float(val), dtype=torch.float32, device='cuda:0')
+            extra_cols.append(col)
+        extra_metrics = torch.stack(extra_cols, dim=-1)
+
         torch.cuda.synchronize()
 
         return (
@@ -524,7 +736,8 @@ class DexmachinaGymnaxWrapper(Environment):
             torch_to_jax(critic_obs),
             torch_to_jax(rew),
             torch_to_jax(terminated | truncated),
-            torch_to_jax(truncated.to(torch.float32))
+            torch_to_jax(truncated.to(torch.float32)),
+            torch_to_jax(extra_metrics),
         )
 
     # ---------------------------------------------------------
@@ -562,12 +775,13 @@ class DexmachinaGymnaxWrapper(Environment):
             jax.ShapeDtypeStruct((self.num_envs,), jnp.float32),                   # rew
             jax.ShapeDtypeStruct((self.num_envs,), jnp.bool_),                     # done
             jax.ShapeDtypeStruct((self.num_envs,), jnp.float32),                   # truncated
+            jax.ShapeDtypeStruct((self.num_envs, len(self.extra_log_keys)), jnp.float32),  # extra log metrics
         )
 
-        obs_jax, critic_jax, rew_jax, dones_jax, truncated_jax = jax.experimental.io_callback(
+        obs_jax, critic_jax, rew_jax, dones_jax, truncated_jax, extra_metrics_jax = jax.experimental.io_callback(
             self._host_step,
             result_shapes,
-            action
+            action,
         )
 
         # Update the dummy state with step counts and truncation
@@ -581,8 +795,9 @@ class DexmachinaGymnaxWrapper(Environment):
         )
 
         # Return Gymnax format: obs, critic_obs, state, reward, done, info
-        # Pass truncation back in info dict
-        return obs_jax, critic_jax, new_state, rew_jax, dones_jax, {}
+        # Pass truncation + DexMachina's per-step diagnostic metrics back in info dict
+        info = {key: extra_metrics_jax[:, i] for i, key in enumerate(self.extra_log_keys)}
+        return obs_jax, critic_jax, new_state, rew_jax, dones_jax, info
     
     def render(self):
         """
@@ -661,26 +876,72 @@ class DexmachinaGymnaxWrapper(Environment):
         return Box(low=-float("inf"), high=float("inf"), shape=(self.obs_dim,)), \
                Box(low=-float("inf"), high=float("inf"), shape=(self.state_dim,))
 
-def make_dexmachina_env(cfg_env, cfg_hyperparameters):
-    """Encapsulates all DexMachina config translation and initialization."""
+_GENESIS_INITIALIZED = False
+
+
+def _genesis_init_once():
+    """gs.init() is process-global and raises if called twice.
+
+    make_dexmachina_env() is now called more than once per process (a training
+    env and a separate evaluation env), so the init has to be idempotent.
+    """
+    global _GENESIS_INITIALIZED
+    if _GENESIS_INITIALIZED:
+        return
+    gs.init(backend=gs.gpu, logging_level="warning")
+    _GENESIS_INITIALIZED = True
+
+
+def make_dexmachina_env(cfg_env, cfg_hyperparameters, eval_mode=False, num_envs=None):
+    """Build a DexMachina BaseEnv.
+
+    eval_mode=True builds a SEPARATE, smaller env for evaluation, mirroring what
+    FastTD3's train.py does. Differences from the training env:
+      * is_eval=True     -> _get_dones() returns `timeout, timeout` BEFORE the
+                            object_fell_off check, so eval episodes always run the
+                            full clip. Sharing one env meant eval episodes died at
+                            ~40/200 steps and every eval metric was averaged over
+                            the easy opening frames only, with a bias that shifted
+                            as the policy got better at surviving.
+      * early_reset_threshold=0 and rand_init_ratio=0 -> no extra termination, no
+                            phase jitter, so eval is deterministic in length.
+      * randomization off.
+      * the curriculum's assistive gains are forced to zero and never advanced, so
+        eval always measures the policy alone.
+    The object stays actuated=True (unlike FastTD3, which sets actuated=False):
+    keeping the virtual DOFs present with zero force range matches the training
+    dynamics more closely than removing them.
+    """
     _ = jax.devices()
-    gs.init(backend=gs.gpu, logging_level='warning')
+    _genesis_init_once()
     
     env_dict = OmegaConf.to_container(cfg_env, resolve=True)
     parser = get_common_argparser()
     fake_args, _ = parser.parse_known_args([]) 
+
+    num_iterations = int(
+        cfg_hyperparameters.total_time_steps // (cfg_hyperparameters.num_steps * cfg_hyperparameters.num_envs)
+    )
     
     overrides = {
-        "num_envs": cfg_hyperparameters.num_envs,
-        "horizon": cfg_hyperparameters.max_episode_steps,
+        "num_envs": int(num_envs) if num_envs else cfg_hyperparameters.num_envs,
+        # NOTE: constructors.py never reads `horizon`; the real episode length is
+        # derived from the clip string. Kept only so fake_args has the attribute.
+        "horizon": cfg_env.get("max_episode_steps", None),
         "learning_rate": cfg_hyperparameters.lr,
-        "max_epochs": cfg_hyperparameters.num_epochs,
+        # curriculum epochs are a normalised progress counter now, NOT the
+        # number of reppo iterations - see DexmachinaGymnaxWrapper.__init__
+        "max_epochs": int(cfg_env.get("curriculum_max_epochs", 10000)),
         "use_retarget_contact": True,
         "early_reset_threshold": 0.0,
         "aux_reset_thres": [0.0, 0.0, 0.0],
         "use_rl_games": True,
         **env_dict, 
     }
+
+    print(f"[ENV] reppo iterations = {num_iterations}, "
+          f"curriculum max_epochs = {int(cfg_env.get('curriculum_max_epochs', 10000))} "
+          f"(normalised progress counter, independent of iteration count)")
 
     for key, value in overrides.items():
         setattr(fake_args, key, value)
@@ -694,6 +955,19 @@ def make_dexmachina_env(cfg_env, cfg_hyperparameters):
         if isinstance(value, dict) and isinstance(env_kwargs.get(key), dict):
             env_kwargs[key].update(value)
 
+    # Print AFTER the yaml merge above. get_all_env_cfg() returns dexmachina's
+    # own defaults (and mangles upper/lower_ratios into {'kp': 'kp', ...} by
+    # iterating a dict); the yaml values only take effect once merged, so
+    # printing earlier shows numbers that are not the ones actually used.
+    cc = env_kwargs['curriculum_cfg']
+    print(f"[CURR] schedule={cc['schedule']} zero_epoch={cc['zero_epoch']} "
+        f"wait={cc['wait_epochs']} interval={cc['interval']} upper={cc['upper_ratios']} "
+        f"rew_thresholds={cc['rew_thresholds']} "
+        f"min_achieved_len={cc.get('min_achieved_len', '0.85*max_ep_len')}")
+    oc = list(env_kwargs['object_cfgs'].values())[0]
+    print(f"[OBJ] actuated={oc.get('actuated')} kp={oc.get('kp')} "
+        f"batch_dofs={env_kwargs['env_cfg']['scene_kwargs'].get('batch_dofs_info')}")
+
     if env_dict.get("curriculum", False):
         for obj_cfg in env_kwargs.get("object_cfgs", {}).values():
             if isinstance(obj_cfg, dict):
@@ -704,5 +978,35 @@ def make_dexmachina_env(cfg_env, cfg_hyperparameters):
         env_cfg_dict = env_kwargs.setdefault("env_cfg", {})
         scene_kwargs = env_cfg_dict.setdefault("scene_kwargs", {})
         scene_kwargs["batch_dofs_info"] = True
-    
-    return BaseEnv(**env_kwargs)
+
+    # get_all_env_cfg() only knows about dexmachina's own argparse keys, so the
+    # ADD-logging flags have to be injected into env_cfg explicitly.
+    env_cfg_dict = env_kwargs.setdefault("env_cfg", {})
+    env_cfg_dict["log_add_metric"] = bool(env_dict.get("log_add_metric", False))
+    env_cfg_dict["add_num_verts"] = int(env_dict.get("add_num_verts", 500))
+
+    if eval_mode:
+        env_cfg_dict["is_eval"] = True
+        env_cfg_dict["early_reset_threshold"] = 0.0
+        env_cfg_dict["early_reset_aux_thres"] = dict(con=0.0, imi=0.0, bc=0.0)
+        env_cfg_dict["rand_init_ratio"] = 0.0
+        env_cfg_dict["record_video"] = False
+        rand_cfg = env_kwargs.setdefault("rand_cfg", {})
+        if isinstance(rand_cfg, dict):
+            rand_cfg["randomize"] = False
+
+    env = BaseEnv(**env_kwargs)
+
+    if eval_mode and getattr(env, "use_curriculum", False) and env.curriculum is not None:
+        # unassisted physics, permanently -- nothing advances this curriculum
+        c = env.curriculum
+        for k in c.decay_terms:
+            c.curr_gains[k] = 0.0
+            c.curr_gains_lower[k] = 0.0
+        c.reset_object_gains()
+        # BaseEnv.step() consults this on every reset; setting it once here means
+        # eval episode ends never enter the curriculum's deques, which is what the
+        # per-call `is_eval` flag used to guarantee.
+        env.record_curriculum = False
+        print("[EVAL ENV] assistive gains zeroed permanently, curriculum bookkeeping off")
+    return env

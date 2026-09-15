@@ -3,29 +3,122 @@
 # --- REPPO Base Variables ---
 type: dexmachina
 name: 
+# null = derive from the clip. dexmachina's constructors.py computes
+# ep_len = end - start from the clip string, so box-30-230 -> 200 and
+# mixer-0-150 -> 150. Setting a number here overrides nothing (a mismatch is
+# warned about and the clip's own length wins) -- leave it null.
+max_episode_steps: null
 reward_scaling: 1.0
 terminate: true
 asymmetric_obs: true 
 vmin: 0
-vmax: 150
+vmax: 400
 
 # --- DexMachina Specific Arguments ---
 hand: "allegro_hand"
 clip: "box-30-230"
 retarget_name: "para"
+action_mode: "hybrid"
+hybrid_scales: [0.1, 1.0]
+group_collisions: true
+observe_tip_dist: true
+observe_contact_force: true
+# Desynchronise the envs' episode clocks. LOAD-BEARING: without it every env
+# starts at t=0 and times out together at 200, so update_progress() fires once
+# per 200 host steps = once per ~164 curriculum epochs. Filling the 30-entry
+# deques would then take ~4900 epochs, and every decay clears them again, so the
+# curriculum would manage 1-2 decays in a whole run. Measured with this on:
+# 128 progress updates by epoch 500. FastTD3 gets the same desync from
+# early_reset_threshold instead, but that only fires once tracking degrades,
+# which is not the case early on when the assist is still holding the object.
+# Cost: ~2% downward bias on max_achieved_length, since `progressed` measures
+# stepped length and a randomly-started env times out after fewer steps.
+rand_init_ratio: 0.02
+
+# Cull episodes whose cumulative task reward falls below 0.6 x steps, checked
+# every early_reset_interval(5) steps. This is FastTD3's value and it is the
+# SAME 0.6 as curriculum_cfg.rew_thresholds.task -- the filter enforces exactly
+# the condition the curriculum gate checks, so surviving episodes clear the gate
+# by construction. We had this hardcoded to 0.0 in make_dexmachina_env, which is
+# what FastTD3 sets only on its eval/render envs. Our eval env forces it to 0.0.
+early_reset_threshold: 0.6
 
 # Enable curriculum learning
-#curriculum: true
-#actuated: true
+curriculum: true
+actuate_object: true
+
+# --- Evaluation ---
+# Evaluation runs on its OWN DexMachina env instance (see make_dexmachina_env
+# eval_mode=True), matching FastTD3. That env is permanently unassisted, has
+# is_eval=True so episodes always run the full clip instead of dying when the
+# object falls, and never advances the curriculum. Because it is separate, eval
+# no longer resets the training simulator, so train/* episode metrics are
+# trustworthy again.
+#
+# NOTE: is_eval=True makes BaseEnv skip the LAST env when stepping the robots
+# (it is reserved for reference visualisation), so one of these envs is inert
+# and contributes a small bias -- 1/256 here.
+num_eval_envs: 1024
+# Log per-step ADD (mean per-vertex distance to the demo pose, metres) per
+# object part. 500 verts/part matches dexmachina/eval/compute_add.py.
+log_add_metric: true
+add_num_verts: 500
+
+# Curriculum epochs are a normalised progress counter (0 -> curriculum_max_epochs
+# across the whole run), matching FastTD3's train.py. Previously one epoch per
+# reppo rollout, which gave only 762 epochs at 50M steps -- far too few for a
+# curriculum with wait_epochs=100 and a hardcoded 40-epoch decay spacing.
+curriculum_max_epochs: 10000
+
+# --- Curriculum (epoch budget = curriculum_max_epochs above) ---
+curriculum_cfg:
+  kp_init: 80.0
+  kv_init: 5.0
+  force_range_init: 50.0
+  schedule: "uniform"
+  fixed_mode: "uniform"
+  uniform_mode: "slow"
+  gain_mode: "all"
+  wait_epochs: 100        # 1% of the run (was 13-66%)
+  interval: 5
+  num_zero_epoch: 1000    # FastTD3's value: last 10% unassisted
+  deque_len: 30           # FastTD3's value (was 50)
+  skip_grad: true
+  dialback_ep_len: 80
+  # NOTE: the episode-length gate is main's min_achieved_len, which defaults to
+  # 0.85 * max_episode_length -- so it scales with the clip (170 for box-30-230,
+  # 127 for mixer-0-150) and needs no key here. Set min_achieved_len to override.
+  rew_thresholds: {task: 0.6, con: 0.01, imi: 0.01, bc: 0.01}
+  # REQUIRED by the remap: with ~250 decay slots instead of ~19, 0.7 would
+  # zero the gains within 8% of training. FastTD3 uses 0.9/0.8.
+  upper_ratios: {kp: 0.9, kv: 0.9, fr: 1.0}
+  lower_ratios: {kp: 0.8, kv: 0.8, fr: 1.0}
 
 # Enable rewards for dexmachina environment
 reward_cfg:
   force_penalty: 0.1
   action_penalty: 0.01
+  # NOTE: task_rew_weight is deliberately NOT set here -- it falls through to
+  # dexmachina's default of 1.0, which is what FastTD3 and train_rl.sh use. We had
+  # pinned it to 5.0, which divided the influence of every auxiliary term by five
+  # (imi 30%->6%, contact ceiling 49%->10% of task max) and is the main reason our
+  # con_rew plateaued at 0.0085 vs FastTD3's 0.068. vmax was dropped 600 -> 250 to
+  # match the resulting return scale.
   imi_rew_weight: 0.3
+  imi_wrist_weight: 0.5
   contact_rew_weight: 3.0
-  bc_rew_weight: 0.1
-  task_rew_weight: 5.0
+  contact_beta: 10.0
+  bc_rew_weight: 0.3
+  bc_beta: 500.0
+  obj_pos_beta: 10.0
+  obj_rot_beta: 1.0
+  # Tried 25.0 to devalue a hold-still policy; MEASURED WORSE. Pooled over the last
+  # 6 checkpoints, lid opening fell 15.2% -> 5.6% of the demo and frames with the
+  # lid past 0.5 rad went 56 -> 0. Raising it shrinks the whole opening phase's
+  # value instead of tilting the policy toward opening, so the policy stopped going
+  # there at all (ep_length 188 -> 160). Keep at 5.0.
+  obj_arti_beta: 5.0
+  use_retarget_contact: true
 
-# [Position, Rotation, Articulation]
+# [Position, Rotation, Articulation] -- matches obj_pos/rot/arti_beta above
 #task_rew_betas: [5.0, 10.0, 1.0]
