@@ -509,7 +509,9 @@ def make_train_fn(
             compute_nstep_lambda,
             (
                 batch.value[-1],
-                jnp.ones_like(batch.truncated[0]),
+                # The rollout end is a truncation only where the episode continues: an episode that ends on the
+                # last step gets target = reward, not a bootstrap from the next episode's first observation.
+                1.0 - batch.done[-1].astype(batch.truncated.dtype),
                 jnp.zeros_like(batch.importance_weight[0]),
             ),
             batch,
