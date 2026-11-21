@@ -729,14 +729,16 @@ class DexmachinaGymnaxWrapper(Environment):
             extra_cols.append(col)
         extra_metrics = torch.stack(extra_cols, dim=-1)
 
+        done, truncation = dexmachina_episode_end_flags(terminated, truncated)
+
         torch.cuda.synchronize()
 
         return (
             torch_to_jax(obs),
             torch_to_jax(critic_obs),
             torch_to_jax(rew),
-            torch_to_jax(terminated | truncated),
-            torch_to_jax(truncated.to(torch.float32)),
+            torch_to_jax(done),
+            torch_to_jax(truncation),
             torch_to_jax(extra_metrics),
         )
 
@@ -877,6 +879,20 @@ class DexmachinaGymnaxWrapper(Environment):
                Box(low=-float("inf"), high=float("inf"), shape=(self.state_dim,))
 
 _GENESIS_INITIALIZED = False
+
+
+def dexmachina_episode_end_flags(terminated, truncated):
+    """(done, truncation) for REPPO from DexMachina's reset flags: every episode end is terminal.
+
+    DexMachina sets terminated == time_out == True for every reset (time-out at the end of the clip, object drop,
+    early reset, NaN env), so its flags cannot mark a real truncation. The task ends with the demonstration and the
+    observation contains t/T, so the end of the clip is a true terminal as well. Reporting truncation = 0 makes
+    REPPO use done = 1 at every end: the lambda target is the last reward with no bootstrap, and the transition stays
+    in the critic loss (both are skipped for truncated transitions). Before, every end was treated as truncated, so
+    a drop never taught the critic that the rewards stop there.
+    """
+    done = terminated | truncated
+    return done, torch.zeros_like(done, dtype=torch.float32)
 
 
 def _genesis_init_once():
