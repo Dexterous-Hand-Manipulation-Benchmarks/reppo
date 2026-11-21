@@ -18,6 +18,7 @@ from mujoco_playground._src.wrapper import wrap_for_brax_training, Wrapper
 # Imports for the Dexmachina Jax Wrapper
 import sys
 import math
+import random
 import torch
 import numpy as np
 import jax.numpy as jnp
@@ -895,7 +896,7 @@ def dexmachina_episode_end_flags(terminated, truncated):
     return done, torch.zeros_like(done, dtype=torch.float32)
 
 
-def _genesis_init_once():
+def _genesis_init_once(seed: int):
     """gs.init() is process-global and raises if called twice.
 
     make_dexmachina_env() is now called more than once per process (a training
@@ -904,11 +905,11 @@ def _genesis_init_once():
     global _GENESIS_INITIALIZED
     if _GENESIS_INITIALIZED:
         return
-    gs.init(backend=gs.gpu, logging_level="warning")
+    gs.init(backend=gs.gpu, logging_level="warning", seed=seed)  # also seeds random / numpy / torch
     _GENESIS_INITIALIZED = True
 
 
-def make_dexmachina_env(cfg_env, cfg_hyperparameters, eval_mode=False, num_envs=None):
+def make_dexmachina_env(cfg_env, cfg_hyperparameters, eval_mode=False, num_envs=None, *, seed: int):
     """Build a DexMachina BaseEnv.
 
     eval_mode=True builds a SEPARATE, smaller env for evaluation, mirroring what
@@ -929,7 +930,7 @@ def make_dexmachina_env(cfg_env, cfg_hyperparameters, eval_mode=False, num_envs=
     dynamics more closely than removing them.
     """
     _ = jax.devices()
-    _genesis_init_once()
+    _genesis_init_once(seed)
     
     env_dict = OmegaConf.to_container(cfg_env, resolve=True)
     parser = get_common_argparser()
@@ -940,6 +941,8 @@ def make_dexmachina_env(cfg_env, cfg_hyperparameters, eval_mode=False, num_envs=
     )
     
     overrides = {
+        # the run seed for dexmachina (args.seed); dexmachina's own default is 42
+        "seed": int(seed),
         "num_envs": int(num_envs) if num_envs else cfg_hyperparameters.num_envs,
         # NOTE: constructors.py never reads `horizon`; the real episode length is
         # derived from the clip string. Kept only so fake_args has the attribute.
@@ -1012,6 +1015,12 @@ def make_dexmachina_env(cfg_env, cfg_hyperparameters, eval_mode=False, num_envs=
             rand_cfg["randomize"] = False
 
     env = BaseEnv(**env_kwargs)
+    # Building the env reseeds the global RNGs with 42 (dexmachina's curriculum; numpy also in the ADD vertex
+    # sampling). Seed again, so the env's later draws from them (random start frames, randomisation) depend on the
+    # run seed. REPPO's own randomness comes from JAX keys and is not affected.
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     if eval_mode and getattr(env, "use_curriculum", False) and env.curriculum is not None:
         # unassisted physics, permanently -- nothing advances this curriculum

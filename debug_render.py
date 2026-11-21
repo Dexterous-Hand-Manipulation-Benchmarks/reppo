@@ -185,7 +185,7 @@ hydra_cfg.env.camera_kwargs = {
 }
 
 print(">>> Initializing evaluation environment via make_dexmachina_env...")
-base_env = make_dexmachina_env(hydra_cfg.env, hydra_cfg.hyperparameters)
+base_env = make_dexmachina_env(hydra_cfg.env, hydra_cfg.hyperparameters, seed=hydra_cfg.seed)
 base_env = DexmachinaGymnaxWrapper(
     env=base_env,
     num_steps=hydra_cfg.hyperparameters.num_steps,

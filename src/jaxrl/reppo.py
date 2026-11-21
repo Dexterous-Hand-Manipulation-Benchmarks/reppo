@@ -987,7 +987,7 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
         )
     elif cfg.env.type == "dexmachina":       
         env = DexmachinaGymnaxWrapper(
-            env=make_dexmachina_env(cfg.env, cfg.hyperparameters),
+            env=make_dexmachina_env(cfg.env, cfg.hyperparameters, seed=cfg.seed),
             num_steps=cfg.hyperparameters.num_steps,
             episode_length=cfg.env.get("max_episode_steps", None),
             clip_obs=cfg.env.get("clip_obs", math.inf),
@@ -1002,7 +1002,7 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
         print(f"[EVAL ENV] building a separate eval env with {num_eval_envs} envs")
         eval_env = DexmachinaGymnaxWrapper(
             env=make_dexmachina_env(
-                cfg.env, cfg.hyperparameters, eval_mode=True, num_envs=num_eval_envs
+                cfg.env, cfg.hyperparameters, eval_mode=True, num_envs=num_eval_envs, seed=cfg.seed
             ),
             num_steps=cfg.hyperparameters.num_steps,
             episode_length=cfg.env.get("max_episode_steps", None),
