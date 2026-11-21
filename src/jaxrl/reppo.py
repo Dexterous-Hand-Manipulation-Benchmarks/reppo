@@ -18,11 +18,15 @@ from jax import numpy as jnp
 from jax.random import PRNGKey
 from omegaconf import DictConfig, OmegaConf
 
-# Logger import
 import os
-import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../logging")))
-from wandb_logger import UniversalLogger
+
+try:  # unified W&B logging when run from the dexhand-bench umbrella repo
+    from dexhand_bench.wandb_logger import UniversalLogger
+except ModuleNotFoundError as e:
+    if e.name != "dexhand_bench":  # installed but broken: fail instead of logging unstandardised metrics
+        raise
+    print("[INFO] dexhand_bench not installed: unified W&B metric logging disabled")
+    UniversalLogger = None
 
 
 # TEMPORARY FIX
@@ -1034,15 +1038,16 @@ def run(cfg: DictConfig, trial: optuna.Trial | None) -> float:
     )
 
     # INSTALL UNIVERSAL LOGGER ONCE OUTSIDE THE LOOP
-    UniversalLogger.install(
-        algo=cfg.get("name", "reppo"),
-        hand=cfg.env.get("hand", "allegro_hand"),
-        clip=cfg.env.get("clip", "box-30-230"),
-        seed=cfg.seed,
-        num_envs=cfg.hyperparameters.num_envs,
-        horizon_length=cfg.hyperparameters.num_steps,
-        keep_model_specific=True,
-    )
+    if UniversalLogger is not None:
+        UniversalLogger.install(
+            algo=cfg.get("name", "reppo"),
+            hand=cfg.env.get("hand", "allegro_hand"),
+            clip=cfg.env.get("clip", "box-30-230"),
+            seed=cfg.seed,
+            num_envs=cfg.hyperparameters.num_envs,
+            horizon_length=cfg.hyperparameters.num_steps,
+            keep_model_specific=True,
+        )
 
     for i in range(completed_trials, cfg.num_trials):
         cfg.seed = cfg.seed + i

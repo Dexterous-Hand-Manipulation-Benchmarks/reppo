@@ -68,7 +68,7 @@ def extract_step(path):
 parser = get_common_argparser()
 parser.add_argument("--ckpt_dir", type=str, required=True)
 parser.add_argument("--wandb_project", type=str, default="dexmachina")
-parser.add_argument("--wandb_entity", type=str, default="schrapsi-kit")
+parser.add_argument("--wandb_entity", type=str, default=None)  # None: WANDB_ENTITY or the account default
 parser.add_argument("--fps", type=int, default=30)
 parser.add_argument(
     "--voc_mode",
